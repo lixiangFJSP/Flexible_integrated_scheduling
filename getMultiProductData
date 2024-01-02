@@ -1,0 +1,287 @@
+import json
+import random
+import numpy as np
+import openpyxl
+import pandas as pd
+from Environment.base.job import Job
+from Environment.base.Operate import Operate as Process
+from Environment.base.ScheduleRequest import ScheduleRequest
+from scipy.stats import uniform, beta, expon
+
+
+class GetData:
+    def __init__(self):
+        self.scheduleRequestDTO = ScheduleRequest()
+
+    def readMultiProductData(self, readPath, jobNum, machineNum, distributionName, IsDynamic=0):
+        """根据一个产品的算例，重复读取，从而达到生成多算例的效果,而机器数是随机生成的"""
+        Jobs = []
+        for j in range(jobNum):
+            df = pd.read_excel(readPath, sheet_name=0, header=0, engine='openpyxl')
+            job = Job(j)
+            job.T_ijave = 0
+            allMachineList = []
+            for i in range(df.shape[0]):
+                process = Process(i)
+                process.id = int(df.iloc[i][0])
+                process.jobId = j
+                process.depth = int(df.iloc[i][1])
+                process.indegree = int(df.iloc[i][2])
+                process.machine = eval(df.iloc[i][3])
+                process.time = eval(df.iloc[i][6])
+                if i == 0:
+                    process.postProcess = "End"
+                else:
+                    process.postProcess = int(df.iloc[i][4])
+                process.preProcess = eval(df.iloc[i][5])
+                # 随机生成工时信息
+                # 对时间进行分布处理
+                if IsDynamic is True:
+                    # 机器的规模变量
+                    process.machine = random.choices([i for i in range(machineNum)],
+                                                     k=random.randint(1, int(machineNum / 4)))
+                    process.time = [random.randint(5, 15) for i in range(len(process.machine))]
+                    self.processTimeDistribution(process.time, distributionName)
+                process.tad = np.mean(process.time)
+                job.processList.append(process)
+                job.T_ijave += process.tad
+                allMachineList.extend(process.machine)
+            job.arrivalTime = 0
+            job.emergencyLevel = random.randint(1, 3)
+            job.due = (0.2 + 0.5 * job.emergencyLevel) * job.T_ijave
+            job.maxMachineNum = max(allMachineList)
+            Jobs.append(job)
+        return Jobs
+
+    def processTimeDistribution(self, processTime, distributionName):
+        newTime = []
+        for time in processTime:
+            if distributionName == "U1":  # 均匀分布
+                a = time - np.sqrt(time)
+                b = time + np.sqrt(time)
+                newTime.append(uniform.rvs(a, b))
+
+            elif distributionName == "U2":  # 均匀分布
+                a = time
+                b = 2 * time
+                newTime.append(uniform.rvs(a, b))
+
+            elif distributionName == "B1":  # 贝塔分布
+                stochasticDuration = beta.rvs(time / 2 - 1 / 3, time - 2 / 3, loc=time / 2,
+                                              scale=2 * time - time / 2)
+                newTime.append(stochasticDuration)
+
+            elif distributionName == "B2":  # 贝塔分布
+                stochasticDuration = beta.rvs(1 / 6, 1 / 3, loc=time / 2, scale=2 * time - time / 2)
+                newTime.append(stochasticDuration)
+
+            elif distributionName == "E":  # 指数分布
+                newTime.append(expon.rvs(time, 2))
+        return newTime
+
+
+def repeatOneExample(fileNameStatic, jobNumStatic, insertJobNum, machineNum, E_ave, DDT, distributionName, IsDynamic):
+    """用于实验的数据集"""
+    getData = GetData()
+    # 获取静态数据
+    StaticJobs = getData.readMultiProductData(fileNameStatic, jobNumStatic, machineNum, distributionName,
+                                              IsDynamic=IsDynamic)
+    getData.scheduleRequestDTO.Jobs = StaticJobs
+    # 获取插单数据
+    DynamicJobs = getData.readMultiProductData(fileNameStatic, insertJobNum, machineNum, distributionName,
+                                               IsDynamic=IsDynamic)
+    getData.scheduleRequestDTO.insertNewJobs = DynamicJobs
+    # getData.readMultiProductDynamicData(fileNameStatic, insertJobNum)
+    # 获取总工件数
+    # jobNum = len(getData.scheduleRequestDTO.Jobs) + len(getData.scheduleRequestDTO.insertNewJobs)
+    # 赋予新工件到达的时间，交货期
+    # 对静态工件进行处理
+    for job in getData.scheduleRequestDTO.Jobs:
+        job.arrivalTime = 0
+        # 随机产生工件的紧急程度
+        job.emergencyLevel = random.randint(1, 3)
+        # 以每道工序的平均时长评估出该工件的交付期
+        job.due = int(job.arrivalTime + (0.2 + DDT * job.emergencyLevel) * job.T_ijave)
+
+    A = np.random.exponential(E_ave, size=insertJobNum)
+    i = 0
+    for job in getData.scheduleRequestDTO.insertNewJobs:
+        job.arrivalTime = int(A[i])
+        # 随机产生工件的紧急程度
+        job.emergencyLevel = random.randint(1, 3)
+        # 以每道工序的平均时长评估出该工件的交付期
+        job.due = int(job.arrivalTime + (0.2 + DDT * job.emergencyLevel) * job.T_ijave)
+        i += 1
+    # 所有需要调度的工件
+    getData.scheduleRequestDTO.Jobs.extend(getData.scheduleRequestDTO.insertNewJobs)
+    # 对所有的交付期进行归一化
+    dueList = []
+    for job in getData.scheduleRequestDTO.Jobs:
+        dueList.append(1 / job.due)
+    # 均方归一化处理
+    # normalizedDueList = [(x - np.mean(dueList)) / np.std(dueList) for x in dueList]
+    allMachineList = []
+    for job in getData.scheduleRequestDTO.Jobs:
+        # job.dueDateTightness = normalizedDueList[job.id]
+        allMachineList.append(job.maxMachineNum)
+    getData.scheduleRequestDTO.maxMachineNum = max(allMachineList) + 1
+    # 这里可以添加机器是否发生故障
+    # 第几台机器发生故障的时间
+    getData.scheduleRequestDTO.changeCutterTimeForMachineDown = list(np.zeros(getData.scheduleRequestDTO.maxMachineNum))
+    # 第几台机器需要维修的时间
+    getData.scheduleRequestDTO.repairTimeForMachineDown = list(np.zeros(getData.scheduleRequestDTO.maxMachineNum))
+    for i in range(getData.scheduleRequestDTO.maxMachineNum):
+        getData.scheduleRequestDTO.changeCutterTimeForMachineDown[i] = random.randint(1, 50)
+        getData.scheduleRequestDTO.repairTimeForMachineDown[i] = random.randint(1, 99)
+    return getData.scheduleRequestDTO
+
+
+def sampleForOneCase(sampleNum, jobNumStatic, insertJobNum, machineNum, E_ave, DDT, distributionName, IsDynamic):
+    """IsDynamic表示是不是动态数据"""
+    fileNameStatic = "D:\\OneDrive\\200Code\\250pythonCode\\ResearchEnvironment\\Small_paper_random_hour_experiment\\MultiProductStaticExperiment\\MK01\\MK01_2.xlsx"
+    # fileNameStatic = "D:\\OneDrive\\200Code\\250pythonCode\\ResearchEnvironment\\Small_paper_random_hour_experiment\\MultiProductStaticExperiment\\MK01\\MK01_4.xlsx"
+    scheduleRequestDTO = []
+    for i in range(sampleNum):
+        # insertJobNum = random.randint(50, 200)
+        temp = repeatOneExample(fileNameStatic, jobNumStatic, insertJobNum, machineNum, E_ave, DDT, distributionName,
+                                IsDynamic)
+        scheduleRequestDTO.append(temp)
+    return scheduleRequestDTO
+
+
+def scheduleRequestDTOToJson(scheduleRequestDTO):
+    Jobs = []
+    for job in scheduleRequestDTO.Jobs:
+        jobToJson = {
+            "T_ijave": job.T_ijave,
+            "arrivalTime": job.arrivalTime,
+            "due": job.due,
+            "dueDateTightness": job.dueDateTightness,
+            "emergencyLevel": job.emergencyLevel,
+            "id": job.id,
+            "maxMachineNum": job.maxMachineNum,
+            "processList": None
+        }
+        processList = []
+        for process in job.processList:
+            processToDic = {
+                "depth": process.depth,
+                "id": process.id,
+                "indegree": process.indegree,
+                "jobId": process.jobId,
+                "machine": process.machine,
+                "postProcess": process.postProcess,
+                "preProcess": process.preProcess,
+                "tad": process.tad,
+                "time": process.time
+            }
+            processList.append(processToDic)
+        jobToJson["processList"] = processList
+        Jobs.append(jobToJson)
+    return Jobs
+
+
+def JsonToscheduleRequestDTO(jsonPath):
+    scheduleRequestDTO = ScheduleRequest()
+    with open(jsonPath, 'r') as f:
+        JobsDict = f.read()
+    # 将JSON字符串转换为Python字典对象
+    JobsDict = json.loads(JobsDict)
+    allMachineList = []
+    Jobs = []
+    for j in range(len(JobsDict)):
+        job = Job(JobsDict[j]["id"])
+        job.T_ijave = JobsDict[j]["T_ijave"]
+        job.arrivalTime = JobsDict[j]["arrivalTime"]
+        job.emergencyLevel = JobsDict[j]["emergencyLevel"]
+        job.due = JobsDict[j]["due"]
+        job.maxMachineNum = JobsDict[j]["maxMachineNum"]
+        allMachineList.append(job.maxMachineNum)
+        for i in range(len(JobsDict[j]["processList"])):
+            process = Process(i)
+            process.id = JobsDict[j]["processList"][i]["id"]
+            process.jobId = JobsDict[j]["processList"][i]["jobId"]
+            process.depth = JobsDict[j]["processList"][i]["depth"]
+            process.indegree = JobsDict[j]["processList"][i]["indegree"]
+            # 机器的规模变量
+            process.machine = JobsDict[j]["processList"][i]["machine"]
+            process.postProcess = JobsDict[j]["processList"][i]["postProcess"]
+            process.preProcess = JobsDict[j]["processList"][i]["preProcess"]
+            # 随机生成工时信息
+            process.time = JobsDict[j]["processList"][i]["time"]
+            process.tad = JobsDict[j]["processList"][i]["tad"]
+            job.processList.append(process)
+        Jobs.append(job)
+        scheduleRequestDTO.Jobs = Jobs
+        scheduleRequestDTO.maxMachineNum = max(allMachineList) + 1
+    return scheduleRequestDTO
+
+
+def saveToJson(sampleNum, insertJobNum, machineNum, E_ave, DDT, distributionName, IsDynamic):
+    """将随机产生的算例数据保存为json格式的数据"""
+    scheduleRequestDTO = sampleForOneCase(sampleNum, 0, insertJobNum, machineNum, E_ave, DDT, distributionName,
+                                          IsDynamic)
+    # 将这些数据保存到文件，作为测试数据对算法进行验证
+    for i in range(sampleNum):
+        Jobs = scheduleRequestDTOToJson(scheduleRequestDTO[i])
+        Jobs = json.dumps(Jobs)
+        filePath = f"W:\\大论文第四章实验\\测试算例\\动态测试算例\\新工件为{insertJobNum}\\m为{machineNum}\\lamda{E_ave}\\DDT{DDT}"
+        with open(f'{filePath}\\{distributionName}-{i}.json', 'w') as f:
+            f.write(Jobs)
+
+
+def saveStaticToJson(sampleNum, Job, machineNum, E_ave, DDT, distributionName, IsDynamic):
+    """将随机产生的算例数据保存为json格式的数据"""
+    scheduleRequestDTO = sampleForOneCase(sampleNum, Job, 0, machineNum, E_ave, DDT, distributionName,
+                                          IsDynamic)
+    # 将这些数据保存到文件，作为测试数据对算法进行验证
+    for i in range(sampleNum):
+        Jobs = scheduleRequestDTOToJson(scheduleRequestDTO[i])
+        Jobs = json.dumps(Jobs)
+        # filePath = f"W:\\大论文第四章实验\\测试算例\\静态测试算例\\工件为{Job}\\m为{machineNum}"
+        filePath = f"W:\\大论文第四章实验\\测试算例\\分支法测试算例\\"
+        with open(f'{filePath}\\{distributionName}-{i}.json', 'w') as f:
+            f.write(Jobs)
+
+
+def ExecutiveSaveProgram():
+    newJob = [30, 40, 60]
+    m = [5, 10, 15]
+    lamda = [50, 100, 200]
+    DDT = [1, 2, 3]
+    distribution = ["U1", "U2", "B1", "B2", "E"]
+    for nj in newJob:
+        for b in m:
+            for l in lamda:
+                for d in DDT:
+                    for dis in distribution:
+                        saveToJson(10, nj, b, l, d, dis, 1)
+
+
+def BatchReadExampleDataProgram():
+    pass
+
+
+def SaveStaticProgram():
+    Job = [30, 40, 60]
+    m = [5, 10, 15]
+    for nj in Job:
+        for b in m:
+            saveStaticToJson(10, nj, b, 0, 1.5, "static", 0)
+
+
+if __name__ == '__main__':
+    # ExecutiveSaveProgram()
+    # 使用小规模程序测试分支法
+    saveStaticToJson(1, 2, 3, 20, 1, 'U1', 0)
+    # newJob = [20, 30, 50]
+    # m = [5, 10, 15]
+    # lamda = [50, 100, 200]
+    # DDT = [0.5, 1, 1.5]
+    # distribution = ["U1", "U2", "B1", "B2", "E"]
+    # for nj in newJob:
+    #     for b in m:
+    #         for l in lamda:
+    #             for d in DDT:
+    #                 for dis in distribution:
+    #                     saveToJson(10, nj, b, l, d, dis, 1)
